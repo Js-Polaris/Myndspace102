@@ -36,7 +36,7 @@ const CONCERNS = [
   "Substance use", "Work or school pressure",
 ];
 
-const PROFESSIONALS = [
+const MOCK_PROFESSIONALS = [
   { id: "p1", name: "Dr. Amara Kintu", title: "Clinical Psychologist", license: "UAP-2291", years: 9, rating: 4.9, sessions: 1180,
     specialties: ["Anxiety", "Trauma", "Grief & loss", "Sleep"],
     modes: ["online", "physical"], rate: 120000,
@@ -63,6 +63,89 @@ const PROFESSIONALS = [
     bio: "Specialises in the anxious mind that won't switch off at night.", tone: PALETTE.clay },
 ];
 
+/* ---------------------------------------------------------------
+   LIVE API CLIENT
+   Talks to the real Tend backend (see the companion /backend
+   project — three Postgres databases, JWT auth, encrypted PHI
+   fields, a payment-gated booking flow). Flip USE_LIVE_API to true
+   and point API_BASE_URL at a reachable deployment of that backend
+   to connect this UI to it for real.
+
+   This preview sandbox can't reach an outside server, so USE_LIVE_API
+   defaults to false and everything runs on local mock state. Every
+   api.* call below is still wired into the components — when a call
+   fails (or is switched off), the caller falls back to the same local
+   behavior this prototype always had, so the app works either way.
+----------------------------------------------------------------*/
+const USE_LIVE_API = false;
+const API_BASE_URL = "http://localhost:4000";
+
+let accessToken = null;
+
+async function apiRequest(path, { method = "GET", body, auth = true } = {}) {
+  const headers = { "Content-Type": "application/json" };
+  if (auth && accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
+}
+
+const TONE_CYCLE = [PALETTE.forest, PALETTE.clay, PALETTE.gold, PALETTE.moss, PALETTE.forestDeep];
+
+// Backend rows (snake_case, UGX field names) -> the shape every
+// frontend component already expects. Keeping this in one place means
+// live data and mock data are interchangeable everywhere else.
+function normalizePro(p, index = 0) {
+  return {
+    id: p.id,
+    name: p.full_name || p.name,
+    title: p.title,
+    license: p.license_number || p.license || "—",
+    years: p.years_experience ?? p.years ?? 0,
+    rating: Number(p.rating) || 0,
+    sessions: p.sessions_completed ?? p.sessions ?? 0,
+    specialties: p.specialties || [],
+    modes: p.modes || [],
+    rate: p.hourly_rate_ugx ?? p.rate ?? 0,
+    bio: p.bio || "",
+    tone: TONE_CYCLE[index % TONE_CYCLE.length],
+  };
+}
+
+function normalizePost(p) {
+  return { id: p.id, proId: p.professional_id, title: p.title, body: p.body, tag: p.tag, date: new Date(p.created_at).toLocaleDateString() };
+}
+
+// Maps the demo picker's mock ids to the real seeded professional
+// accounts in platform_db (see backend/src/db/seed.js).
+const DEMO_PRO_LOGINS = {
+  p1: "amara.kintu@tend.demo", p2: "michael.okello@tend.demo", p3: "grace.namono@tend.demo",
+  p4: "sarah.nabatanzi@tend.demo", p5: "david.mugisha@tend.demo", p6: "grace.achieng@tend.demo",
+};
+const DEMO_PRO_PASSWORD = "Demo12345!";
+
+const api = {
+  setToken(token) { accessToken = token; },
+  registerPatient: (payload) => apiRequest("/api/auth/register/patient", { method: "POST", body: payload, auth: false }),
+  login: (email, password) => apiRequest("/api/auth/login", { method: "POST", body: { email, password }, auth: false }),
+  getMyProfessional: () => apiRequest("/api/professionals/me"),
+  listProfessionals: () => apiRequest("/api/professionals"),
+  createAppointment: (body) => apiRequest("/api/appointments", { method: "POST", body }),
+  payAppointment: (id, method) => apiRequest(`/api/appointments/${id}/pay`, { method: "POST", body: { method } }),
+  myAppointments: () => apiRequest("/api/appointments/mine"),
+  listFeed: () => apiRequest("/api/feed"),
+  postFeed: (body) => apiRequest("/api/feed", { method: "POST", body }),
+  addMood: (body) => apiRequest("/api/patients/mood", { method: "POST", body }),
+  listMood: () => apiRequest("/api/patients/mood"),
+  addJournal: (body) => apiRequest("/api/patients/journal", { method: "POST", body }),
+  listJournal: () => apiRequest("/api/patients/journal"),
+};
+
 const SLOTS = ["09:00", "11:30", "14:00", "16:30"];
 
 function nextDays(n) {
@@ -84,8 +167,8 @@ function ugx(n) {
   return "UGX " + n.toLocaleString();
 }
 
-function matchProfessionals(patient) {
-  const scored = PROFESSIONALS.map((pro) => {
+function matchProfessionals(patient, pros = MOCK_PROFESSIONALS) {
+  const scored = pros.map((pro) => {
     let score = 0;
     const overlap = pro.specialties.filter((s) => patient.concerns.includes(s));
     score += overlap.length * 3;
@@ -281,11 +364,13 @@ function Landing({ onPick }) {
 function Onboarding({ onDone, onBack }) {
   const [step, setStep] = useState(0);
   const [form, setForm] = useState({
-    name: "", email: "", phone: "", dob: "", gender: "",
+    name: "", email: "", password: "", phone: "", dob: "", gender: "",
     concerns: [], modePref: "either", urgency: "routine",
     kin1: { name: "", relation: "", phone: "" },
     kin2: { name: "", relation: "", phone: "" },
   });
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState(null);
 
   const steps = ["About you", "What's going on", "Next of kin", "Your matches"];
 
@@ -299,10 +384,41 @@ function Onboarding({ onDone, onBack }) {
   const matches = useMemo(() => matchProfessionals(form), [step]);
 
   const canNext = () => {
-    if (step === 0) return form.name && form.email && form.phone && form.dob;
+    if (step === 0) return form.name && form.email && form.password.length >= 10 && form.phone && form.dob;
     if (step === 1) return form.concerns.length > 0;
     if (step === 2) return form.kin1.name && form.kin1.phone && form.kin2.name && form.kin2.phone;
     return true;
+  };
+
+  // Tries the real backend first (registers the account, saves
+  // next-of-kin encrypted, runs matching server-side). Falls back to
+  // the local mock match shown in the step-3 preview if that call
+  // isn't reachable — same UX either way, just not backed by a
+  // real account in mock mode.
+  const finish = async () => {
+    setSubmitting(true);
+    setSubmitError(null);
+    if (USE_LIVE_API) {
+      try {
+        const res = await api.registerPatient({
+          email: form.email, password: form.password, fullName: form.name,
+          phone: form.phone, dateOfBirth: form.dob, gender: form.gender || undefined,
+          concerns: form.concerns, modePref: form.modePref, urgency: form.urgency,
+          nextOfKin: [form.kin1, form.kin2],
+        });
+        api.setToken(res.accessToken);
+        const liveProfessionals = res.matches.map((m, i) => normalizePro(m.professional, i));
+        const matchedIds = res.matches.map((m) => m.professionalId);
+        setSubmitting(false);
+        onDone({ ...form, id: res.patient.id }, matchedIds, liveProfessionals, { accessToken: res.accessToken, refreshToken: res.refreshToken, role: "patient" });
+        return;
+      } catch (err) {
+        console.warn("Live registration failed, continuing in local demo mode:", err.message);
+        setSubmitError("Couldn't reach the server — continuing with a local demo account.");
+      }
+    }
+    setSubmitting(false);
+    onDone(form, matches.map((m) => m.pro.id), null, null);
   };
 
   return (
@@ -343,6 +459,9 @@ function Onboarding({ onDone, onBack }) {
                 </Field>
                 <Field label="Email">
                   <TextInput type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="jane@email.com" />
+                </Field>
+                <Field label="Password" hint="At least 10 characters, with a number.">
+                  <TextInput type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="••••••••••" />
                 </Field>
                 <Field label="Phone number">
                   <TextInput value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} placeholder="+256 7XX XXX XXX" />
@@ -463,9 +582,14 @@ function Onboarding({ onDone, onBack }) {
             {step < 3 ? (
               <PrimaryButton disabled={!canNext()} onClick={() => setStep(step + 1)} icon={ChevronRight}>Continue</PrimaryButton>
             ) : (
-              <PrimaryButton onClick={() => onDone(form, matches.map((m) => m.pro.id))} icon={ArrowRight}>Go to my dashboard</PrimaryButton>
+              <PrimaryButton disabled={submitting} onClick={finish} icon={ArrowRight}>{submitting ? "Setting up your account…" : "Go to my dashboard"}</PrimaryButton>
             )}
           </div>
+          {submitError && (
+            <div className="flex gap-2 items-start rounded-lg p-3 text-sm mt-4" style={{ background: PALETTE.clayPale, color: PALETTE.forestDeep }}>
+              <AlertCircle size={16} className="mt-0.5 shrink-0" /> {submitError}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -506,14 +630,22 @@ function Sidebar({ tabs, active, onChange, onExit, name, subtitle }) {
   );
 }
 
-function FeedTab({ posts }) {
+function FeedTab({ posts, setPosts, professionals }) {
+  const [loaded, setLoaded] = React.useState(false);
+  React.useEffect(() => {
+    if (!USE_LIVE_API || loaded) return;
+    api.listFeed()
+      .then((rows) => { if (rows.length) setPosts(rows.map(normalizePost)); setLoaded(true); })
+      .catch((err) => { console.warn("Feed fetch failed, showing local posts:", err.message); setLoaded(true); });
+  }, [loaded]);
+
   return (
     <div className="max-w-2xl">
       <h1 style={{ fontFamily: "Fraunces, serif", fontSize: 28, color: PALETTE.ink }}>Daily feed</h1>
       <p className="text-sm mb-6" style={{ color: PALETTE.inkSoft }}>Grounded tips from your care team, posted as they come to mind.</p>
       <div className="space-y-0">
         {posts.map((post, i) => {
-          const pro = PROFESSIONALS.find((p) => p.id === post.proId);
+          const pro = professionals.find((p) => p.id === post.proId) || professionals[0];
           return (
             <div key={post.id} className="py-5" style={{ borderTop: i === 0 ? "none" : `1px solid ${PALETTE.line}` }}>
               <div className="flex items-center gap-2 mb-1.5">
@@ -609,27 +741,75 @@ function PaymentForm({ amount, onPaid, onCancel }) {
   );
 }
 
-function BookingTab({ patient, appointments, setAppointments, matchedIds }) {
+function BookingTab({ patient, appointments, setAppointments, matchedIds, professionals }) {
   const [proId, setProId] = useState(matchedIds[0]);
   const [mode, setMode] = useState("online");
   const [day, setDay] = useState(null);
   const [slot, setSlot] = useState(null);
   const [paying, setPaying] = useState(false);
   const [filter, setFilter] = useState("matched");
+  const [liveApptId, setLiveApptId] = useState(null);
+  const [bookingError, setBookingError] = useState(null);
+  const [loadedHistory, setLoadedHistory] = useState(false);
 
-  const pro = PROFESSIONALS.find((p) => p.id === proId);
-  const list = filter === "matched" ? PROFESSIONALS.filter((p) => matchedIds.includes(p.id)) : PROFESSIONALS;
+  const pro = professionals.find((p) => p.id === proId);
+  const list = filter === "matched" ? professionals.filter((p) => matchedIds.includes(p.id)) : professionals;
   const days = nextDays(6);
 
-  const confirmBooking = (method) => {
+  // Pull real appointment history once, on a real account, instead of
+  // starting from an empty list every reload.
+  React.useEffect(() => {
+    if (!USE_LIVE_API || !patient.id || loadedHistory) return;
+    api.myAppointments()
+      .then((rows) => {
+        setAppointments(rows.map((a) => ({
+          id: a.id, proId: a.professional_id, mode: a.mode,
+          date: new Date(a.scheduled_start).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }),
+          time: new Date(a.scheduled_start).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }),
+          status: a.status, method: null, amount: a.amount_ugx, patientName: patient.name,
+        })));
+        setLoadedHistory(true);
+      })
+      .catch((err) => { console.warn("Appointment history fetch failed:", err.message); setLoadedHistory(true); });
+  }, [loadedHistory, patient.id]);
+
+  // Reserving the slot happens before payment against the real API
+  // (mirrors the backend: an appointment exists as pending_payment
+  // before it can ever be paid). Falls back to a client-only id if the
+  // call fails or we're in mock mode, so the flow never dead-ends.
+  const startPayment = async () => {
+    setBookingError(null);
+    if (USE_LIVE_API) {
+      try {
+        const scheduledStart = new Date(day);
+        const [h, m] = slot.split(":").map(Number);
+        scheduledStart.setHours(h, m, 0, 0);
+        const appt = await api.createAppointment({ professionalId: proId, mode, scheduledStart: scheduledStart.toISOString() });
+        setLiveApptId(appt.id);
+      } catch (err) {
+        console.warn("Live appointment reservation failed, continuing in local demo mode:", err.message);
+        setBookingError("Couldn't reach the server — this booking will only be saved locally.");
+      }
+    }
+    setPaying(true);
+  };
+
+  const confirmBooking = async (method) => {
+    if (USE_LIVE_API && liveApptId) {
+      try {
+        await api.payAppointment(liveApptId, method);
+      } catch (err) {
+        console.warn("Live payment failed, recording locally instead:", err.message);
+      }
+    }
     setAppointments((a) => [
       ...a,
       {
-        id: Date.now(), proId, mode, date: fmtDate(day), time: slot,
+        id: liveApptId || Date.now(), proId, mode, date: fmtDate(day), time: slot,
         status: "confirmed", method, amount: pro.rate, patientName: patient.name,
       },
     ]);
-    setPaying(false); setDay(null); setSlot(null);
+    setPaying(false); setDay(null); setSlot(null); setLiveApptId(null);
   };
 
   return (
@@ -641,17 +821,18 @@ function BookingTab({ patient, appointments, setAppointments, matchedIds }) {
         <div className="mb-8 space-y-2">
           <div className="text-sm font-medium" style={{ color: PALETTE.ink }}>Your appointments</div>
           {appointments.map((a) => {
-            const p = PROFESSIONALS.find((x) => x.id === a.proId);
+            const p = professionals.find((x) => x.id === a.proId);
+            if (!p) return null;
             return (
               <div key={a.id} className="flex items-center justify-between rounded-lg px-4 py-3" style={{ border: `1px solid ${PALETTE.line}`, background: PALETTE.card }}>
                 <div className="flex items-center gap-3">
                   {a.mode === "online" ? <Video size={16} color={PALETTE.forest} /> : <MapPin size={16} color={PALETTE.clay} />}
                   <div>
                     <div className="text-sm" style={{ color: PALETTE.ink }}>{p.name} · {a.date} at {a.time}</div>
-                    <div className="text-xs" style={{ color: PALETTE.inkSoft }}>{a.mode === "online" ? "Online session, in-app" : "In-person visit"} · paid via {a.method === "card" ? "card" : "mobile money"}</div>
+                    <div className="text-xs" style={{ color: PALETTE.inkSoft }}>{a.mode === "online" ? "Online session, in-app" : "In-person visit"}{a.method ? ` · paid via ${a.method === "card" ? "card" : "mobile money"}` : ""}</div>
                   </div>
                 </div>
-                <Badge tone={PALETTE.forest}>Confirmed</Badge>
+                <Badge tone={PALETTE.forest}>{a.status === "confirmed" ? "Confirmed" : a.status}</Badge>
               </div>
             );
           })}
@@ -713,11 +894,16 @@ function BookingTab({ patient, appointments, setAppointments, matchedIds }) {
             </>
           )}
 
+          {bookingError && (
+            <div className="flex gap-2 items-start rounded-lg p-3 text-sm mb-3" style={{ background: PALETTE.clayPale, color: PALETTE.forestDeep }}>
+              <AlertCircle size={16} className="mt-0.5 shrink-0" /> {bookingError}
+            </div>
+          )}
           {slot && !paying && (
-            <PrimaryButton onClick={() => setPaying(true)}>Continue to payment · {ugx(pro.rate)}</PrimaryButton>
+            <PrimaryButton onClick={startPayment}>Continue to payment · {ugx(pro.rate)}</PrimaryButton>
           )}
           {slot && paying && (
-            <PaymentForm amount={pro.rate} onPaid={confirmBooking} onCancel={() => setPaying(false)} />
+            <PaymentForm amount={pro.rate} onPaid={confirmBooking} onCancel={() => { setPaying(false); setLiveApptId(null); }} />
           )}
         </div>
       )}
@@ -736,10 +922,26 @@ const MOODS = [
 function MoodTab({ entries, setEntries }) {
   const [val, setVal] = useState(null);
   const [note, setNote] = useState("");
+  const [loaded, setLoaded] = React.useState(false);
 
-  const save = () => {
-    setEntries((e) => [{ date: new Date().toLocaleDateString(), val, note }, ...e]);
+  React.useEffect(() => {
+    if (!USE_LIVE_API || loaded) return;
+    api.listMood()
+      .then((rows) => {
+        if (rows.length) setEntries(rows.map((r) => ({ date: new Date(r.loggedAt).toLocaleDateString(), val: r.moodValue, note: r.note })));
+        setLoaded(true);
+      })
+      .catch((err) => { console.warn("Mood history fetch failed:", err.message); setLoaded(true); });
+  }, [loaded]);
+
+  const save = async () => {
+    const entry = { date: new Date().toLocaleDateString(), val, note };
+    setEntries((e) => [entry, ...e]);
     setVal(null); setNote("");
+    if (USE_LIVE_API) {
+      try { await api.addMood({ moodValue: entry.val, note: entry.note || undefined }); }
+      catch (err) { console.warn("Saving mood check-in to the server failed, kept locally:", err.message); }
+    }
   };
 
   return (
@@ -794,11 +996,27 @@ function JournalTab({ entries, setEntries }) {
   const [writing, setWriting] = useState(false);
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
+  const [loaded, setLoaded] = React.useState(false);
 
-  const save = () => {
+  React.useEffect(() => {
+    if (!USE_LIVE_API || loaded) return;
+    api.listJournal()
+      .then((rows) => {
+        if (rows.length) setEntries(rows.map((r) => ({ id: r.id, title: r.title, body: r.body, date: new Date(r.createdAt).toLocaleDateString() })));
+        setLoaded(true);
+      })
+      .catch((err) => { console.warn("Journal history fetch failed:", err.message); setLoaded(true); });
+  }, [loaded]);
+
+  const save = async () => {
     if (!body.trim()) return;
-    setEntries((e) => [{ id: Date.now(), title: title || "Untitled entry", body, date: new Date().toLocaleDateString() }, ...e]);
+    const entry = { id: Date.now(), title: title || "Untitled entry", body, date: new Date().toLocaleDateString() };
+    setEntries((e) => [entry, ...e]);
     setTitle(""); setBody(""); setWriting(false);
+    if (USE_LIVE_API) {
+      try { await api.addJournal({ title: entry.title, body: entry.body }); }
+      catch (err) { console.warn("Saving journal entry to the server failed, kept locally:", err.message); }
+    }
   };
 
   return (
@@ -839,14 +1057,15 @@ function JournalTab({ entries, setEntries }) {
   );
 }
 
-function CareTeamTab({ matchedIds }) {
+function CareTeamTab({ matchedIds, professionals }) {
   return (
     <div className="max-w-2xl">
       <h1 style={{ fontFamily: "Fraunces, serif", fontSize: 28, color: PALETTE.ink }}>Your care team</h1>
       <p className="text-sm mb-6" style={{ color: PALETTE.inkSoft }}>Matched to you when you signed up.</p>
       <div className="space-y-3">
         {matchedIds.map((id) => {
-          const p = PROFESSIONALS.find((x) => x.id === id);
+          const p = professionals.find((x) => x.id === id);
+          if (!p) return null;
           return (
             <div key={id} className="rounded-xl p-4 flex gap-4" style={{ border: `1px solid ${PALETTE.line}`, background: PALETTE.card }}>
               <div className="w-12 h-12 rounded-full flex items-center justify-center shrink-0" style={{ background: p.tone, color: PALETTE.card }}>
@@ -926,7 +1145,7 @@ function SecurityTab() {
   );
 }
 
-function PatientDashboard({ patient, matchedIds, onExit, sharedState }) {
+function PatientDashboard({ patient, matchedIds, professionals, onExit, sharedState }) {
   const [tab, setTab] = useState("feed");
   const tabs = [
     { id: "feed", label: "Daily feed", icon: MessageCircle },
@@ -940,11 +1159,11 @@ function PatientDashboard({ patient, matchedIds, onExit, sharedState }) {
     <div className="flex" style={{ background: PALETTE.paper }}>
       <Sidebar tabs={tabs} active={tab} onChange={setTab} onExit={onExit} name={patient.name} subtitle="Patient" />
       <div className="flex-1 p-10">
-        {tab === "feed" && <FeedTab posts={sharedState.posts} />}
-        {tab === "book" && <BookingTab patient={patient} appointments={sharedState.appointments} setAppointments={sharedState.setAppointments} matchedIds={matchedIds} />}
+        {tab === "feed" && <FeedTab posts={sharedState.posts} setPosts={sharedState.setPosts} professionals={professionals} />}
+        {tab === "book" && <BookingTab patient={patient} appointments={sharedState.appointments} setAppointments={sharedState.setAppointments} matchedIds={matchedIds} professionals={professionals} />}
         {tab === "mood" && <MoodTab entries={sharedState.moods} setEntries={sharedState.setMoods} />}
         {tab === "journal" && <JournalTab entries={sharedState.journal} setEntries={sharedState.setJournal} />}
-        {tab === "team" && <CareTeamTab matchedIds={matchedIds} />}
+        {tab === "team" && <CareTeamTab matchedIds={matchedIds} professionals={professionals} />}
         {tab === "security" && <SecurityTab />}
       </div>
     </div>
@@ -953,17 +1172,40 @@ function PatientDashboard({ patient, matchedIds, onExit, sharedState }) {
 
 /* ============================= PROFESSIONAL SIDE ============================= */
 
-function ProfessionalPicker({ onPick, onBack }) {
+function ProfessionalPicker({ professionals, onPick, onBack }) {
+  const [signingIn, setSigningIn] = useState(null);
+  const [error, setError] = useState(null);
+
+  // Demo "login" for the six seeded professional accounts. Real
+  // credential entry (email/password/MFA) is what a production login
+  // screen would show instead of a picker list.
+  const pick = async (p) => {
+    setError(null);
+    if (USE_LIVE_API && DEMO_PRO_LOGINS[p.id]) {
+      setSigningIn(p.id);
+      try {
+        const res = await api.login(DEMO_PRO_LOGINS[p.id], DEMO_PRO_PASSWORD);
+        api.setToken(res.accessToken);
+      } catch (err) {
+        console.warn("Live professional login failed, continuing in local demo mode:", err.message);
+        setError("Couldn't reach the server — continuing with a local demo session.");
+      }
+      setSigningIn(null);
+    }
+    onPick(p.id);
+  };
+
   return (
     <div className="min-h-screen flex items-center justify-center" style={{ background: PALETTE.paper }}>
       <div className="max-w-md w-full">
         <Brand />
         <h2 className="mt-8 mb-1" style={{ fontFamily: "Fraunces, serif", fontSize: 26, color: PALETTE.ink }}>Continue as</h2>
         <p className="text-sm mb-6" style={{ color: PALETTE.inkSoft }}>Demo login — pick a certified professional profile.</p>
+        {error && <p className="text-xs mb-3" style={{ color: PALETTE.clay }}>{error}</p>}
         <div className="space-y-2">
-          {PROFESSIONALS.slice(0, 3).map((p) => (
-            <button key={p.id} onClick={() => onPick(p.id)} className="w-full flex items-center gap-3 rounded-xl p-4 text-left"
-              style={{ border: `1px solid ${PALETTE.line}`, background: PALETTE.card }}>
+          {professionals.slice(0, 3).map((p) => (
+            <button key={p.id} disabled={signingIn === p.id} onClick={() => pick(p)} className="w-full flex items-center gap-3 rounded-xl p-4 text-left"
+              style={{ border: `1px solid ${PALETTE.line}`, background: PALETTE.card, opacity: signingIn === p.id ? 0.6 : 1 }}>
               <div className="w-10 h-10 rounded-full flex items-center justify-center" style={{ background: p.tone, color: PALETTE.card }}>
                 {p.name.split(" ").map((n) => n[0]).slice(-2).join("")}
               </div>
@@ -981,12 +1223,14 @@ function ProfessionalPicker({ onPick, onBack }) {
   );
 }
 
-function ProDashboard({ proId, onExit, sharedState }) {
+function ProDashboard({ proId, professionals, onExit, sharedState }) {
   const [tab, setTab] = useState("requests");
-  const pro = PROFESSIONALS.find((p) => p.id === proId);
+  const pro = professionals.find((p) => p.id === proId);
   const [postTitle, setPostTitle] = useState("");
   const [postBody, setPostBody] = useState("");
   const [postTag, setPostTag] = useState("Tip");
+  const [liveAppointments, setLiveAppointments] = useState(null);
+  const [loadedAppts, setLoadedAppts] = useState(false);
 
   const tabs = [
     { id: "requests", label: "Appointments", icon: Calendar },
@@ -994,11 +1238,41 @@ function ProDashboard({ proId, onExit, sharedState }) {
     { id: "profile", label: "Profile & credentials", icon: ShieldCheck },
   ];
 
-  const myAppointments = sharedState.appointments.filter((a) => a.proId === proId);
+  // When signed in for real, the professional's own bookings come
+  // straight from the backend (scoped server-side to their id — see
+  // GET /api/appointments/mine). Falls back to the shared local state
+  // used by the rest of this prototype otherwise.
+  React.useEffect(() => {
+    if (!USE_LIVE_API || loadedAppts) return;
+    api.myAppointments()
+      .then((rows) => {
+        setLiveAppointments(rows.map((a) => ({
+          id: a.id, mode: a.mode,
+          date: new Date(a.scheduled_start).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }),
+          time: new Date(a.scheduled_start).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }),
+          amount: a.amount_ugx, patientName: `Patient ${a.patient_id.slice(0, 8)}`,
+        })));
+        setLoadedAppts(true);
+      })
+      .catch((err) => { console.warn("Professional appointment fetch failed, showing local bookings:", err.message); setLoadedAppts(true); });
+  }, [loadedAppts]);
 
-  const publish = () => {
+  const myAppointments = liveAppointments ?? sharedState.appointments.filter((a) => a.proId === proId);
+
+  const publish = async () => {
     if (!postBody.trim()) return;
-    sharedState.setPosts((p) => [{ id: Date.now(), proId, title: postTitle || "A note for today", body: postBody, tag: postTag, date: new Date().toLocaleDateString() }, ...p]);
+    const localPost = { id: Date.now(), proId, title: postTitle || "A note for today", body: postBody, tag: postTag, date: new Date().toLocaleDateString() };
+    if (USE_LIVE_API) {
+      try {
+        const saved = await api.postFeed({ title: localPost.title, body: localPost.body, tag: localPost.tag });
+        sharedState.setPosts((p) => [normalizePost(saved), ...p]);
+        setPostTitle(""); setPostBody("");
+        return;
+      } catch (err) {
+        console.warn("Publishing to the live feed failed, saving locally instead:", err.message);
+      }
+    }
+    sharedState.setPosts((p) => [localPost, ...p]);
     setPostTitle(""); setPostBody("");
   };
 
@@ -1067,6 +1341,10 @@ export default function App() {
   const [patient, setPatient] = useState(null);
   const [matchedIds, setMatchedIds] = useState([]);
   const [proId, setProId] = useState(null);
+  // Live-matched professionals replace the mock list the moment
+  // registration succeeds against the real backend; every tab reads
+  // from this single array so mock and live data are interchangeable.
+  const [professionals, setProfessionals] = useState(MOCK_PROFESSIONALS);
 
   const [posts, setPosts] = useState([
     { id: 1, proId: "p2", title: "Naming the pressure helps", tag: "Tip", date: "2 days ago",
@@ -1097,20 +1375,33 @@ export default function App() {
       {screen === "onboarding" && (
         <Onboarding
           onBack={() => setScreen("landing")}
-          onDone={(form, ids) => { setPatient(form); setMatchedIds(ids); setScreen("patient-dash"); }}
+          onDone={(form, ids, liveProfessionals) => {
+            setPatient(form);
+            setMatchedIds(ids);
+            if (liveProfessionals?.length) {
+              // Merge rather than replace, so professionals not in the
+              // top-3 match are still bookable from "Everyone".
+              setProfessionals((prev) => {
+                const byId = new Map(prev.map((p) => [p.id, p]));
+                liveProfessionals.forEach((p) => byId.set(p.id, p));
+                return Array.from(byId.values());
+              });
+            }
+            setScreen("patient-dash");
+          }}
         />
       )}
 
       {screen === "patient-dash" && patient && (
-        <PatientDashboard patient={patient} matchedIds={matchedIds} onExit={() => setScreen("landing")} sharedState={sharedState} />
+        <PatientDashboard patient={patient} matchedIds={matchedIds} professionals={professionals} onExit={() => setScreen("landing")} sharedState={sharedState} />
       )}
 
       {screen === "pro-pick" && (
-        <ProfessionalPicker onBack={() => setScreen("landing")} onPick={(id) => { setProId(id); setScreen("pro-dash"); }} />
+        <ProfessionalPicker professionals={professionals} onBack={() => setScreen("landing")} onPick={(id) => { setProId(id); setScreen("pro-dash"); }} />
       )}
 
       {screen === "pro-dash" && proId && (
-        <ProDashboard proId={proId} onExit={() => setScreen("landing")} sharedState={sharedState} />
+        <ProDashboard proId={proId} professionals={professionals} onExit={() => setScreen("landing")} sharedState={sharedState} />
       )}
     </div>
   );
